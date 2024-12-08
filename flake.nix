@@ -1,52 +1,92 @@
 {
-  description = "A zoom screen application tool";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    cranix.url = "github:Lemin-n/cranix/2af6b2e71577bb8836b10e28f3267f2c5342a8fd";
     crane.url = "github:ipetkov/crane";
     fenix.url = "github:nix-community/fenix";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = {
-    self,
     nixpkgs,
     flake-utils,
     ...
-  } @ inputs:
-  # Iterate over Arm, x86 for MacOs 🍎 and Linux 🐧
-    flake-utils.lib.eachSystem (flake-utils.lib.defaultSystems) (
+  } @ inputs: let
+      fenix = inputs.fenix.packages;
+    in
+    # Iterate over Arm, x86 for MacOs 🍎 and Linux 🐧
+    (flake-utils.lib.eachDefaultSystem (
       system: let
-        zoomerBundle = import ./nix {
-          inherit system;
-          pkgs = nixpkgs.legacyPackages.${system};
-          crane = inputs.crane.lib;
-          cranix = inputs.cranix.lib;
-          fenix = inputs.fenix.packages;
+        pkgs = nixpkgs.legacyPackages.${system};
+        crane = inputs.crane.mkLib pkgs;
+        # Toolchain
+        toolchain = fenix.${system}.fromToolchainFile {
+          file = ./rust-toolchain.toml;
+          sha256 = "sha256-yMuSb5eQPO/bHv+Bcf/US8LVMbf/G/0MSfiPwBhiPpk=";
+        };
+        craneLib = crane.overrideToolchain toolchain;
+
+        buildInputs = with pkgs; [
+          openssl.dev
+          pkg-config
+          wayland
+        ];
+
+        src = pkgs.lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter = path: type:
+            (pkgs.lib.hasInfix "/assets" path)
+            || (craneLib.filterCargoSources path type);
+        };
+        commonArgs = {
+          doCheck = false;
+          inherit src buildInputs;
+          nativeBuildInputs = libraries;
+        };
+
+        libraries = with pkgs; [
+          vulkan-loader
+          libxkbcommon
+          wayland
+          xorg.libX11
+        ];
+        # Compile all artifacts
+        appDeps = craneLib.buildDepsOnly commonArgs;
+
+        exampleNames = map (file: pkgs.lib.removeSuffix ".rs" file) (builtins.attrNames (builtins.readDir ./examples));
+
+        # Compile
+        pkg = name: craneLib.buildPackage (commonArgs// {
+          cargoExtraArgs = "--example ${name}";
+          cargoArtifacts = appDeps;
+        });
+        app = name: flake-utils.lib.mkApp {
+          drv = pkg name;
         };
       in {
-        inherit (zoomerBundle) apps packages devShells;
+        # nix build
+        packages = {
+          default = pkg "help_world";
+        } // builtins.listToAttrs (map (name: {
+          name = name;
+          value = pkg name;
+        }) exampleNames);
+
+        # nix run
+        apps = {
+          default = app "help_world";
+        } // builtins.listToAttrs (map (name: {
+          name = name;
+          value = app name;
+        }) exampleNames);
+
+        # nix develop
+        devShells.default = craneLib.devShell {
+          inherit buildInputs;
+
+          packages = [ toolchain ] ++ libraries;
+
+          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}";
+        };
       }
-    )
-    // {
-      # Overlays
-      overlays.default = import ./nix/overlay.nix {
-        crane = inputs.crane.lib;
-        cranix = inputs.cranix.lib;
-        fenix = inputs.fenix.packages;
-      };
-      # nixosModules
-      nixosModules = {
-        default = import ./nix/nixos-module.nix {
-          crane = inputs.crane.lib;
-          cranix = inputs.cranix.lib;
-          fenix = inputs.fenix.packages;
-        };
-        home-manager = import ./nix/hm-module.nix {
-          crane = inputs.crane.lib;
-          cranix = inputs.cranix.lib;
-          fenix = inputs.fenix.packages;
-        };
-      };
-    };
+    ));
 }
